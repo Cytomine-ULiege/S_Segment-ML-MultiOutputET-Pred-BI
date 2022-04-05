@@ -4,16 +4,75 @@ import numpy as np
 from pathlib import Path
 
 from pyxit.estimator import COLORSPACE_RGB, COLORSPACE_TRGB, COLORSPACE_HSV, COLORSPACE_GRAY, _raw_to_trgb, _raw_to_hsv
+import shapely
 from shapely import wkt
-from shapely.affinity import affine_transform
+from shapely.affinity import affine_transform, translate
 from skimage.util.shape import view_as_windows
 
-from cytomine import CytomineJob
+from cytomine import CytomineJob, Cytomine
 from cytomine.models import ImageInstanceCollection, ImageInstance, AttachedFileCollection, Job, PropertyCollection, \
-    AnnotationCollection, Annotation
+    AnnotationCollection, Annotation, JobCollection
 from cytomine.utilities.software import parse_domain_list, str2bool
-from sldc import SemanticSegmenter, SSLWorkflowBuilder, StandardOutputLogger, Logger, ImageWindow
-from sldc_cytomine import CytomineTileBuilder, CytomineSlide
+from sldc import SemanticSegmenter, SSLWorkflowBuilder, StandardOutputLogger, Logger, ImageWindow, Image
+from sldc_cytomine import CytomineTileBuilder
+from sldc_cytomine.image_adapter import CytomineDownloadableTile
+
+
+class CytomineSlide(Image):
+    """
+    A slide from a cytomine project
+    """
+
+    def __init__(self, img_instance, zoom_level=0):
+        """Construct CytomineSlide objects
+
+        Parameters
+        ----------
+        img_instance: ImageInstance
+            The the image instance
+        zoom_level: int
+            The zoom level at which the slide must be read. The maximum zoom level is 0 (most zoomed in). The greater
+            the value, the lower the zoom.
+        """
+        self._img_instance = img_instance
+        self._zoom_level = zoom_level
+
+    @classmethod
+    def from_id(cls, id_img_instance, zoom_level=0):
+        return cls(ImageInstance.fetch(id_img_instance), zoom_level=zoom_level)
+
+    @property
+    def image_instance(self):
+        return self._img_instance
+
+    @property
+    def np_image(self):
+        raise NotImplementedError("Disabled due to the too heavy size of the images")
+
+    @property
+    def width(self):
+        return self._img_instance.width // (2 ** self.zoom_level)
+
+    @property
+    def height(self):
+        return self._img_instance.height // (2 ** self.zoom_level)
+
+    @property
+    def channels(self):
+        return 3
+
+    @property
+    def zoom_level(self):
+        return self._zoom_level
+
+    @property
+    def api_zoom_level(self):
+        """The zoom level used by cytomine api uses 0 as lower level of zoom (most zoomed out). This property
+        returns a zoom value that can be used to communicate with the backend."""
+        return self._img_instance.depth - self.zoom_level
+
+    def __str__(self):
+        return "CytomineSlide (#{}) ({} x {}) (zoom: {})".format(self._img_instance.id, self.width, self.height, self.zoom_level)
 
 
 def extract_windows(image, dims, step):
@@ -62,9 +121,9 @@ class ExtraTreesSegmenter(SemanticSegmenter):
 
     def segment(self, image):
         # extract mask
-        mask = np.ones(image.shape[:2], dtype=np.bool)
+        mask = np.ones(image.shape[:2], dtype="bool")
         if image.ndim == 3 and image.shape[2] == 2 or image.shape[2] == 4:
-            mask = image[:, :, -1].astype(np.bool)
+            mask = image[:, :, -1].astype("bool")
             image = np.copy(image[:, :, :-1])  # remove mask from image
 
         # skip processing if tile is supposed background (checked via mean & std) or not in the mask
@@ -86,8 +145,8 @@ class ExtraTreesSegmenter(SemanticSegmenter):
         y = np.array(self._pyxit.base_estimator.predict_proba(subwindows))
 
         cm_dims = list(image.shape[:2]) + [self._pyxit.n_classes_]
-        confidence_map = np.zeros(cm_dims, dtype=np.float)
-        pred_count_map = np.zeros(cm_dims[:2], dtype=np.int)
+        confidence_map = np.zeros(cm_dims, dtype="float")
+        pred_count_map = np.zeros(cm_dims[:2], dtype="int32")
 
         for row, w_index in enumerate(w_identifiers):
             im_width = image.shape[1]
@@ -106,15 +165,16 @@ class ExtraTreesSegmenter(SemanticSegmenter):
 
 
 class AnnotationAreaChecker(object):
-    def __init__(self, min_area, max_area):
+    def __init__(self, min_area, max_area, level):
         self._min_area = min_area
         self._max_area = max_area
+        self._level = level
 
     def check(self, annot):
         if self._max_area < 0:
-            return self._min_area < annot.area
+            return self._min_area < annot.area * (2**self._level)
         else:
-            return self._min_area < annot.area < self._max_area
+            return self._min_area < (annot.area * (2**self._level)) < self._max_area
 
 
 def change_referential(p, height):
@@ -125,7 +185,7 @@ def get_iip_window_from_annotation(slide, annotation, zoom_level):
     """generate a iip-compatible roi based on an annotation at the given zoom level"""
     roi_polygon = change_referential(wkt.loads(annotation.location), slide.image_instance.height)
     if zoom_level == 0:
-        return slide.window_from_polygon(roi_polygon)
+        return slide.window_from_polygon(roi_polygon, mask=True)
     # recompute the roi so that it matches the iip tile topology
     zoom_ratio = 1 / (2 ** zoom_level)
     scaled_roi = affine_transform(roi_polygon, [zoom_ratio, 0, 0, zoom_ratio, 0, 0])
@@ -140,23 +200,6 @@ def get_iip_window_from_annotation(slide, annotation, zoom_level):
 
 
 def extract_images_or_rois(parameters):
-    id_annotations = parse_domain_list(parameters.cytomine_roi_annotations)
-    # if ROI annotations are provided
-    if len(id_annotations) > 0:
-        image_cache = dict()  # maps ImageInstance id with CytomineSlide object
-        zones = list()
-        for id_annot in id_annotations:
-            annotation = Annotation().fetch(id_annot)
-            if annotation.image not in image_cache:
-                image_cache[annotation.image] = CytomineSlide(annotation.image, parameters.cytomine_zoom_level)
-            window = get_iip_window_from_annotation(
-                image_cache[annotation.image],
-                annotation,
-                parameters.cytomine_zoom_level
-            )
-            zones.append(window)
-        return zones
-
     # work at image level or ROIs by term
     images = ImageInstanceCollection()
     if parameters.cytomine_id_images is not None:
@@ -169,13 +212,15 @@ def extract_images_or_rois(parameters):
     if parameters.cytomine_id_roi_term is None:
         return slides
 
-    # fetch ROI annotations
+    # fetch ROI annotations, all users
     collection = AnnotationCollection(
         terms=[parameters.cytomine_id_roi_term],
         reviewed=parameters.cytomine_reviewed_roi,
-        showWKT=True
-    )
-    collection.fetch_with_filter(project=parameters.cytomine_id_project)
+        project=parameters.cytomine_id_project,
+        showWKT=True,
+        includeAlgo=True
+    ).fetch()
+
     slides_map = {slide.image_instance.id: slide for slide in slides}
     regions = list()
     for annotation in collection:
@@ -185,6 +230,23 @@ def extract_images_or_rois(parameters):
         regions.append(get_iip_window_from_annotation(slide, annotation, parameters.cytomine_zoom_level))
 
     return regions
+
+
+class CytomineOldIIPTile(CytomineDownloadableTile):
+    def download_tile_image(self):
+        slide = self.base_image
+        col_tile = self.abs_offset_x // 256
+        row_tile = self.abs_offset_y // 256
+        _slice = slide.image_instance
+        response = Cytomine.get_instance().get('imaging_server.json', None)
+        imageServerUrl = response['collection'][0]['url']
+        return Cytomine.get_instance().download_file(imageServerUrl + "/image/tile", self.cache_filepath, False, payload={
+            "zoomify": _slice.fullPath,
+            "mimeType": _slice.mime,
+            "x": col_tile,
+            "y": row_tile,
+            "z": slide.api_zoom_level
+        })
 
 
 def main(argv):
@@ -226,7 +288,7 @@ def main(argv):
         builder = SSLWorkflowBuilder()
         builder.set_tile_size(cj.parameters.cytomine_tile_size, cj.parameters.cytomine_tile_size)
         builder.set_overlap(cj.parameters.cytomine_tile_overlap)
-        builder.set_tile_builder(CytomineTileBuilder(working_path, n_jobs=cj.parameters.n_jobs))
+        builder.set_tile_builder(CytomineTileBuilder(working_path, tile_class=CytomineOldIIPTile, n_jobs=cj.parameters.n_jobs))
         builder.set_logger(StandardOutputLogger(level=Logger.INFO))
         builder.set_n_jobs(1)
         builder.set_background_class(0)
@@ -245,7 +307,8 @@ def main(argv):
 
         area_checker = AnnotationAreaChecker(
             min_area=cj.parameters.min_annotation_area,
-            max_area=cj.parameters.max_annotation_area
+            max_area=cj.parameters.max_annotation_area,
+            level=cj.parameters.cytomine_zoom_level
         )
 
         def get_term(label):
@@ -257,9 +320,15 @@ def main(argv):
             # multi-class
             return [label]
 
+        zoom_mult = (2 ** cj.parameters.cytomine_zoom_level)
         zones = extract_images_or_rois(cj.parameters)
         for zone in cj.monitor(zones, start=50, end=90, period=0.05, prefix="Segmenting images/ROIs"):
             results = workflow.process(zone)
+
+            if cj.parameters.cytomine_id_roi_term is not None:
+                ROI = change_referential(translate(zone.polygon_mask, zone.offset[0], zone.offset[1]), zone.base_image.height)
+                if cj.parameters.cytomine_zoom_level > 0:
+                    ROI = affine_transform(ROI, [zoom_mult, 0, 0, zoom_mult, 0, 0])
 
             annotations = AnnotationCollection()
             for obj in results:
@@ -268,17 +337,45 @@ def main(argv):
                 polygon = obj.polygon
                 if isinstance(zone, ImageWindow):
                     polygon = affine_transform(polygon, [1, 0, 0, 1, zone.abs_offset_x, zone.abs_offset_y])
+
+
                 polygon = change_referential(polygon, zone.base_image.height)
                 if cj.parameters.cytomine_zoom_level > 0:
-                    zoom_mult = (2 ** cj.parameters.cytomine_zoom_level)
                     polygon = affine_transform(polygon, [zoom_mult, 0, 0, zoom_mult, 0, 0])
-                annotations.append(Annotation(
-                    location=polygon.wkt,
-                    id_terms=get_term(obj.label),
-                    id_project=cj.project.id,
-                    id_image=zone.base_image.image_instance.id
-                ))
-            annotations.save()
+
+
+                if cj.parameters.cytomine_id_roi_term is not None:
+                    polygon = polygon.intersection(ROI)
+
+                if not polygon.is_empty:
+                    annotations.append(Annotation(
+                        location=polygon.wkt,
+                        id_terms=get_term(obj.label),
+                        id_project=cj.project.id,
+                        id_image=zone.base_image.image_instance.id
+                    ))
+            """        
+            Some annotations found thanks to the algorithm are Geometry Collections,
+            containing more than one element -> keep only polygons from those 
+            GeometryCollections
+            """
+            annotations_ok = AnnotationCollection()
+            for annotation in annotations:
+                if isinstance(shapely.wkt.loads(annotation.location), shapely.geometry.collection.GeometryCollection):
+                    for geom in shapely.wkt.loads(annotation.location):
+                        if isinstance(geom, shapely.geometry.Polygon):
+                            annotations_ok.append(Annotation(
+                                location=geom.wkt,
+                                id_terms=annotation.term,
+                                id_project=annotation.project,
+                                id_image=annotation.image
+                            ))
+                elif isinstance(shapely.wkt.loads(annotation.location), shapely.geometry.Polygon):
+                    annotations_ok.append(annotation)
+                else:
+                    continue
+                    
+            annotations_ok.save()
 
         cj.job.update(status=Job.TERMINATED, status_comment="Finish", progress=100)
 

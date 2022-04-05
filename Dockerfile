@@ -1,19 +1,10 @@
-FROM python:3.6.9-stretch
-
-# --------------------------------------------------------------------------------------------
-# Install Cytomine python client
-RUN git clone https://github.com/cytomine-uliege/Cytomine-python-client.git && \
-    cd /Cytomine-python-client && \
-# git checkout tags/v2.7.1 &&
-    pip install . && \
-    rm -r /Cytomine-python-client
+FROM cytomine/software-python3-base:v2.2.2
 
 # --------------------------------------------------------------------------------------------
 # Instal Pyxit, Skimage and SLDC
-RUN pip install pyxit==1.1.5 scikit-image==0.17.2 sldc==1.2.4 sldc-cytomine==1.2.2
+RUN pip install pyxit==1.1.5 scikit-image==0.17.2 sldc==1.4.1 sldc-cytomine==1.3.3
 
 # --------------------------------------------------------------------------------------------
-# Instal Pyxit
 ADD descriptor.json /app/descriptor.json
 ADD run.py /app/run.py
 
